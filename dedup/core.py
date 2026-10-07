@@ -259,13 +259,14 @@ class DedupWindow:
     def seen(self, key):
         """键在窗口里当前是否还有出现。"""
         key = _require_key(key)
-        return self._sketch.maybe_contains(key)
+        return self._sketch.maybe_contains(key) and key in self._counts
 
     # ---- 内部结构 -------------------------------------------------
 
     def _advance_watermark(self, tick):
         """水标是见过的最晚刻度。"""
-        self._watermark = tick
+        if self._watermark is None or tick > self._watermark:
+            self._watermark = tick
 
     def _accept(self, tick, key):
         """收下一条到达并给出判定。"""
@@ -273,7 +274,8 @@ class DedupWindow:
         first = key not in self._first
         evicted = self._record(tick, key)
         self._arrivals += 1
-        self._duplicates += 1
+        if duplicate:
+            self._duplicates += 1
         return Observation(tick, key, True, duplicate, first,
                            self._counts.get(key, 0), evicted)
 
@@ -283,7 +285,8 @@ class DedupWindow:
         self._sequence += 1
         heapq.heappush(self._heap, (tick, sequence, key))
         self._counts[key] = self._counts.get(key, 0) + 1
-        self._first[key] = tick
+        if key not in self._first:
+            self._first[key] = tick
         self._sketch.add(key)
         evicted = self._enforce_capacity()
         if self._sketch.fill() > self._fill_limit:
@@ -293,7 +296,7 @@ class DedupWindow:
     def _enforce_capacity(self):
         """按容量淘汰最旧的到达。"""
         evicted = []
-        while len(self._counts) > self._capacity:
+        while len(self._heap) > self._capacity:
             evicted.append(self._release())
         self._evictions += len(evicted)
         return tuple(evicted)
@@ -314,7 +317,7 @@ class DedupWindow:
         if self._watermark is None:
             return 0
         dropped = 0
-        while self._heap and self._heap[0][0] < self._watermark - self._span:
+        while self._heap and self._heap[0][0] <= self._watermark - self._span:
             self._release()
             dropped += 1
         self._expired += dropped
@@ -322,11 +325,13 @@ class DedupWindow:
         return dropped
 
     def _prune_sketch(self, dropped):
-        """窗口空出来以后，近似结构可以重新开始。"""
+        """有出现离开窗口后，按窗口里剩下的键重建近似结构。"""
         if dropped:
-            self._sketch.reset()
+            self._rebuild_sketch()
 
     def _rebuild_sketch(self):
-        """近似结构写满时重建。"""
+        """近似结构写满或有出现离开时重建：清空并重放窗口里还在的键。"""
         self._sketch.reset()
+        for key in self._counts:
+            self._sketch.add(key)
         self._rebuilds += 1
